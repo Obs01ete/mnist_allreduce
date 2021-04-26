@@ -59,15 +59,15 @@ class ReferenceModel(GenericModel):
         self.optimizer = optimizer_factory(self.model.parameters())
         self.scheduler = self.lr_scheduler_factory(self.optimizer)
 
-    def step(self, data, target, dry_run=False):
-        if self.is_train:
+    def step(self, data, target, no_grad=False, dry_run=False):
+        if not no_grad:
             self.optimizer.zero_grad()
-        with contextlib.nullcontext() if self.is_train else torch.no_grad():
+        with torch.no_grad() if no_grad else contextlib.nullcontext():
             output = self.model(data)
             loss = self.loss_functor(output, target)
-        if self.is_train:
+        if not no_grad:
             loss.backward()
-        if not dry_run:
+        if not dry_run and not no_grad:
             self.optimizer.step()
         return dict(loss=loss.item(), output=output.detach())
 
@@ -127,7 +127,7 @@ class DataparallelModel(GenericModel):
         for group in zip(*param_groups):
             yield group
 
-    def step(self, data, target, dry_run=False):
+    def step(self, data, target, no_grad=False, dry_run=False):
 
         assert len(data) % self.num_replicas == 0
         offset = len(data) // self.num_replicas
@@ -137,12 +137,12 @@ class DataparallelModel(GenericModel):
         for i_replica, (model, optimizer) in enumerate(zip(self.models, self.optimizers)):
             data_rep = data[i_replica*offset:(i_replica+1)*offset]
             target_rep = target[i_replica*offset:(i_replica+1)*offset]
-            if self.is_train:
+            if not no_grad:
                 optimizer.zero_grad()
-            with contextlib.nullcontext() if self.is_train else torch.no_grad():
+            with torch.no_grad() if no_grad else contextlib.nullcontext():
                 output = model(data_rep)
                 loss = self.loss_functor(output, target_rep)
-            if self.is_train:
+            if not no_grad:
                 loss.backward()
             losses.append(loss.item())
             outputs.append(output.detach())
@@ -153,27 +153,14 @@ class DataparallelModel(GenericModel):
 
         # gradient allreduce here
 
-        for param_group in self.param_group_gen():
-            param_group_data = tuple(p.grad for p in param_group)
-            reduced_tensor = torch.mean(torch.stack(param_group_data, dim=0), dim=0)
-            for grad in param_group_data:
-                grad[...] = reduced_tensor[...]
+        if not no_grad:
+            for param_group in self.param_group_gen():
+                param_group_data = tuple(p.grad for p in param_group)
+                reduced_tensor = torch.mean(torch.stack(param_group_data, dim=0), dim=0)
+                for grad in param_group_data:
+                    grad[...] = reduced_tensor[...]
 
-        # for param_group in self.param_group_gen():
-        #     print("------------ 1")
-        #     param_group_grad = tuple(p.grad for p in param_group)
-        #     for grad in param_group_grad:
-        #         print(grad[0, 0, ...])
-        #     print("------------ 2")
-        #     reduced_tensor = torch.mean(torch.stack(param_group_grad, dim=0), dim=0)
-        #     print(reduced_tensor[0, 0, ...])
-        #     print("------------ 3")
-        #     for grad in param_group_grad:
-        #         grad[...] = reduced_tensor[...]
-        #         print(grad[0, 0, ...])
-        #     break
-
-        if not dry_run:
+        if not dry_run and not no_grad:
             for i_replica, (model, optimizer) in enumerate(zip(self.models, self.optimizers)):
                 optimizer.step()
 
@@ -272,12 +259,10 @@ class Trainer:
         for batch_idx, (data, target) in enumerate(self.train_loader):
             data, target = data.to(self.device), target.to(self.device)
 
-            dry_run = False
-
-            step_info_ref = self.reference_model.step(data, target, dry_run=dry_run)
+            step_info_ref = self.reference_model.step(data, target)
             ref_loss = step_info_ref["loss"]
 
-            step_info_dp = self.dataparallel_model.step(data, target, dry_run=dry_run)
+            step_info_dp = self.dataparallel_model.step(data, target)
             dp_loss = step_info_dp["loss"]
 
             if batch_idx % self.args.log_interval == 0:
@@ -292,7 +277,7 @@ class Trainer:
         correct = 0
         for data, target in self.test_loader:
             data, target = data.to(self.device), target.to(self.device)
-            step_info_dp = self.dataparallel_model.step(data, target)
+            step_info_dp = self.dataparallel_model.step(data, target, no_grad=True)
             test_loss += step_info_dp["loss"]  # sum up batch loss
             pred = step_info_dp["output"].argmax(dim=1, keepdim=True)  # get the index of the max log-probability
             correct += pred.eq(target.view_as(pred)).sum().item()

@@ -11,6 +11,9 @@ class TestDataParallel(unittest.TestCase):
         args = parse_args(external_args=[])
         trainer = Trainer(args)
 
+        trainer.reference_model.train(True)
+        trainer.dataparallel_model.train(True)
+
         def _compare_models():
             for i_layer, (ref_np, dp_np) in enumerate(zip(
                     trainer.reference_model.named_parameters(),
@@ -39,24 +42,39 @@ class TestDataParallel(unittest.TestCase):
 
                 break
 
+        def _check_dp_models_equal():
+            dp_model = trainer.dataparallel_model
+            for i_model, model in enumerate(dp_model.models):
+                if i_model == dp_model.master_model_idx:
+                    continue
+                master_model_params = dp_model.models[dp_model.master_model_idx].parameters()
+                model_params = model.parameters()
+                for i_layer, (master_param, secondary_param) in enumerate(zip(master_model_params, model_params)):
+                    if i_layer == 0:
+                        print(f"Master model and model {i_model}")
+                        print(master_param[0, 0, ...])
+                        print(secondary_param[0, 0, ...])
+                    # Important that after all-reduced gradients are applied,
+                    # all replica weights are bit-exactly equal even as float32 values!
+                    tt.assert_equal(master_param, secondary_param)
+
         print("Before step")
         _compare_models()
+        _check_dp_models_equal()
 
         for batch_idx, (data, target) in enumerate(trainer.train_loader):
             data, target = data.to(trainer.device), target.to(trainer.device)
 
-            dry_run = False
-
-            step_info_ref = trainer.reference_model.step(data, target, dry_run=dry_run)
+            step_info_ref = trainer.reference_model.step(data, target)
             ref_loss = step_info_ref["loss"]
 
-            step_info_dp = trainer.dataparallel_model.step(data, target, dry_run=dry_run)
+            step_info_dp = trainer.dataparallel_model.step(data, target)
             dp_loss = step_info_dp["loss"]
 
             print("After step")
             print(f"Loss, reference={ref_loss} dp={dp_loss}")
-
             _compare_models()
+            _check_dp_models_equal()
 
             break
 
