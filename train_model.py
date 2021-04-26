@@ -1,5 +1,6 @@
-from __future__ import print_function
 import argparse
+from functools import partial
+import contextlib
 
 import numpy as np
 import torch
@@ -37,21 +38,78 @@ class Net(nn.Module):
         return output
 
 
-class DataparallelModel:
-    def __init__(self, net_factory, optimizer_factory, loss_functor, num_replicas, reference_model=None):
+class GenericModel:
+    def __init__(self):
+        self.is_train = True
+
+    def train(self, is_train: bool = True):
+        self.is_train = is_train
+
+
+class ReferenceModel(GenericModel):
+    def __init__(self, net_factory, optimizer_factory, lr_scheduler_factory, loss_functor):
+        super().__init__()
+
         self.net_factory = net_factory
         self.optimizer_factory = optimizer_factory
+        self.lr_scheduler_factory = lr_scheduler_factory
+        self.loss_functor = loss_functor
+
+        self.model: nn.Module = net_factory()
+        self.optimizer = optimizer_factory(self.model.parameters())
+        self.scheduler = self.lr_scheduler_factory(self.optimizer)
+
+    def step(self, data, target, dry_run=False):
+        if self.is_train:
+            self.optimizer.zero_grad()
+        with contextlib.nullcontext() if self.is_train else torch.no_grad():
+            output = self.model(data)
+            loss = self.loss_functor(output, target)
+        if self.is_train:
+            loss.backward()
+        if not dry_run:
+            self.optimizer.step()
+        return dict(loss=loss.item(), output=output.detach())
+
+    def get_model(self):
+        return self.model
+
+    def named_parameters(self):
+        return self.model.named_parameters()
+
+    def train(self, is_train: bool = True):
+        super().train(is_train)
+        self.model.train(is_train)
+
+    def lr_scheduler_step(self):
+        self.scheduler.step()
+
+
+class DataparallelModel(GenericModel):
+    def __init__(self, net_factory, optimizer_factory, lr_scheduler_factory,
+                 loss_functor, num_replicas, reference_model=None):
+        super().__init__()
+
+        self.net_factory = net_factory
+        self.optimizer_factory = optimizer_factory
+        self.lr_scheduler_factory = lr_scheduler_factory
         self.loss_functor = loss_functor
         self.num_replicas = num_replicas
+
         models = []
         optimizers = []
+        schedulers = []
         for i_replica in range(num_replicas):
             model = net_factory()
             models.append(model)
             optimizer = self.optimizer_factory(model.parameters())
             optimizers.append(optimizer)
+            scheduler = self.lr_scheduler_factory(optimizer)
+            schedulers.append(scheduler)
+
         self.models = models
         self.optimizers = optimizers
+        self.schedulers = schedulers
 
         self.master_model_idx = 0
 
@@ -64,8 +122,6 @@ class DataparallelModel:
                 for param in param_group[1:]:
                     param.data[...] = param_group[self.master_model_idx].data[...]
 
-        self.current_loss = None
-
     def param_group_gen(self):
         param_groups = [m.parameters() for m in self.models]
         for group in zip(*param_groups):
@@ -77,41 +133,45 @@ class DataparallelModel:
         offset = len(data) // self.num_replicas
 
         losses = []
+        outputs = []
         for i_replica, (model, optimizer) in enumerate(zip(self.models, self.optimizers)):
             data_rep = data[i_replica*offset:(i_replica+1)*offset]
             target_rep = target[i_replica*offset:(i_replica+1)*offset]
-            # if i_replica == 0:
-            #     print("Replica data:", data_rep.shape)
-            #     print(data_rep[0, 0, 15, ...])
-            optimizer.zero_grad()
-            output = model(data_rep)
-            loss = self.loss_functor(output, target_rep)
-            loss.backward()
+            if self.is_train:
+                optimizer.zero_grad()
+            with contextlib.nullcontext() if self.is_train else torch.no_grad():
+                output = model(data_rep)
+                loss = self.loss_functor(output, target_rep)
+            if self.is_train:
+                loss.backward()
             losses.append(loss.item())
+            outputs.append(output.detach())
 
-        self.current_loss = np.sum(np.array(losses))
+        total_loss = np.mean(np.array(losses))
+
+        outputs = torch.cat(outputs, dim=0)
 
         # gradient allreduce here
 
-        # for param_group in self.param_group_gen():
-        #     param_group_data = tuple(p.grad for p in param_group)
-        #     sum_tensor = torch.sum(torch.stack(param_group_data, dim=0), dim=0)
-        #     for param in param_group:
-        #         param.grad[...] = sum_tensor[...]
-
         for param_group in self.param_group_gen():
-            print("------------ 1")
-            param_group_grad = tuple(p.grad for p in param_group)
-            for grad in param_group_grad:
-                print(grad[0, 0, ...])
-            print("------------ 2")
-            sum_tensor = torch.sum(torch.stack(param_group_grad, dim=0), dim=0)
-            print(sum_tensor[0, 0, ...])
-            print("------------ 3")
-            for grad in param_group_grad:
-                grad[...] = sum_tensor[...]
-                print(grad[0, 0, ...])
-            break
+            param_group_data = tuple(p.grad for p in param_group)
+            reduced_tensor = torch.mean(torch.stack(param_group_data, dim=0), dim=0)
+            for grad in param_group_data:
+                grad[...] = reduced_tensor[...]
+
+        # for param_group in self.param_group_gen():
+        #     print("------------ 1")
+        #     param_group_grad = tuple(p.grad for p in param_group)
+        #     for grad in param_group_grad:
+        #         print(grad[0, 0, ...])
+        #     print("------------ 2")
+        #     reduced_tensor = torch.mean(torch.stack(param_group_grad, dim=0), dim=0)
+        #     print(reduced_tensor[0, 0, ...])
+        #     print("------------ 3")
+        #     for grad in param_group_grad:
+        #         grad[...] = reduced_tensor[...]
+        #         print(grad[0, 0, ...])
+        #     break
 
         if not dry_run:
             for i_replica, (model, optimizer) in enumerate(zip(self.models, self.optimizers)):
@@ -119,10 +179,7 @@ class DataparallelModel:
 
         # check all replica weights are identical
 
-        return
-
-    def get_loss(self):
-        return self.current_loss
+        return dict(loss=total_loss, pred=outputs)
 
     def named_gradients(self):
         assert len(self.models) > 0
@@ -134,6 +191,19 @@ class DataparallelModel:
     def named_parameters(self):
         assert len(self.models) > 0
         return self.models[self.master_model_idx].named_parameters()
+
+    def get_model(self):
+        assert len(self.models) > 0
+        return self.models[self.master_model_idx]
+
+    def train(self, is_train: bool = True):
+        super().train(is_train)
+        for model in self.models:
+            model.train(is_train)
+
+    def lr_scheduler_step(self):
+        for scheduler in self.schedulers:
+            scheduler.step()
 
 
 class Trainer:
@@ -159,12 +229,12 @@ class Trainer:
             transforms.ToTensor(),
             transforms.Normalize((0.1307,), (0.3081,))
         ])
-        self.dataset1 = datasets.MNIST('../data', train=True, download=True,
-                                  transform=transform)
-        self.dataset2 = datasets.MNIST('../data', train=False,
-                                  transform=transform)
-        self.train_loader = torch.utils.data.DataLoader(self.dataset1, **train_kwargs)
-        self.test_loader = torch.utils.data.DataLoader(self.dataset2, **test_kwargs)
+        self.dataset_train = datasets.MNIST('../data', train=True, download=True,
+                                       transform=transform)
+        self.dataset_val = datasets.MNIST('../data', train=False,
+                                       transform=transform)
+        self.train_loader = torch.utils.data.DataLoader(self.dataset_train, **train_kwargs)
+        self.test_loader = torch.utils.data.DataLoader(self.dataset_val, **test_kwargs)
 
         def net_factory():
             return Net()
@@ -172,97 +242,60 @@ class Trainer:
         def optimizer_factory(params):
             return optim.Adadelta(params, lr=args.lr)
 
-        self.model = net_factory()
-        self.optimizer = optimizer_factory(self.model.parameters())
+        self.loss_func = partial(F.nll_loss, reduction="mean")
 
-        from functools import partial
-        self.loss_func = partial(F.nll_loss, reduction="sum")
+        def lr_scheduler_factory(optimizer):
+            return StepLR(optimizer, step_size=1, gamma=args.gamma)
 
-        num_replicas = 4
-        self.dataparallel_model = DataparallelModel(net_factory, optimizer_factory, self.loss_func, num_replicas,
-                                                    reference_model=self.model)
+        self.reference_model = ReferenceModel(net_factory, optimizer_factory, lr_scheduler_factory, self.loss_func)
 
-        self.scheduler = StepLR(self.optimizer, step_size=1, gamma=args.gamma)
+        num_replicas = args.num_replicas
+        self.dataparallel_model = DataparallelModel(net_factory, optimizer_factory, lr_scheduler_factory,
+                                                    self.loss_func, num_replicas,
+                                                    reference_model=self.reference_model.get_model())
 
     def train(self):
         for epoch in range(1, self.args.epochs + 1):
             self.train_epoch(epoch)
             self.test()
-            self.scheduler.step()
-            if self.args.dry_run:
-                break
+            self.reference_model.lr_scheduler_step()
+            self.dataparallel_model.lr_scheduler_step()
 
         if self.args.save_model:
-            torch.save(self.model.state_dict(), "mnist_cnn.pt")
+            torch.save(self.reference_model.get_model().state_dict(), "mnist_cnn_ref.pt")
+            torch.save(self.dataparallel_model.get_model().state_dict(), "mnist_cnn_ref.pt")
 
     def train_epoch(self, epoch):
-        self.model.train()
-
-        def _print_info():
-            for ref_np, dp_np in zip(self.model.named_parameters(), self.dataparallel_model.named_parameters()):
-                print(ref_np[0], dp_np[0])
-                # print("Weights:")
-                # print(ref_np[1].data[0, 0, ...])
-                # print(dp_np[1].data[0, 0, ...])
-                print("Grads:")
-                if ref_np[1].grad is not None:
-                    print(ref_np[1].grad[0, 0, ...])
-                else:
-                    print("None")
-                if dp_np[1].grad is not None:
-                    print(dp_np[1].grad[0, 0, ...])
-                else:
-                    print("None")
-                print("")
-                break
-
-        _print_info()
+        self.reference_model.train(True)
+        self.dataparallel_model.train(True)
 
         for batch_idx, (data, target) in enumerate(self.train_loader):
             data, target = data.to(self.device), target.to(self.device)
 
-            dry_run = True
+            dry_run = False
 
-            self.optimizer.zero_grad()
-            # _num_replicas = 4
-            # i_replica = 0
-            # assert len(data) % _num_replicas == 0
-            # offset = len(data) // _num_replicas
-            # data_rep = data[i_replica*offset:(i_replica+1)*offset]
-            # target_rep = target[i_replica*offset:(i_replica+1)*offset]
-            # print("Regular data:", data_rep.shape)
-            # print(data_rep[0, 0, 15, ...])
-            output = self.model(data)
-            loss = self.loss_func(output, target)
-            loss.backward()
-            if not dry_run:
-                self.optimizer.step()
+            step_info_ref = self.reference_model.step(data, target, dry_run=dry_run)
+            ref_loss = step_info_ref["loss"]
 
-            _print_info()
-
-            self.dataparallel_model.step(data, target, dry_run=dry_run)
-            dp_loss = self.dataparallel_model.get_loss()
-
-            print(f"Loss, reference={loss.item()} dp={dp_loss}")
-
-            _print_info()
+            step_info_dp = self.dataparallel_model.step(data, target, dry_run=dry_run)
+            dp_loss = step_info_dp["loss"]
 
             if batch_idx % self.args.log_interval == 0:
-                print('Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}'.format(
+                print('Train Epoch: {} [{}/{} ({:.0f}%)]\tRef loss: {:.6f}\tDP loss: {:.6f}'.format(
                     epoch, batch_idx * len(data), len(self.train_loader.dataset),
-                    100. * batch_idx / len(self.train_loader), loss.item()))
+                    100. * batch_idx / len(self.train_loader), ref_loss, dp_loss))
 
     def test(self):
-        self.model.eval()
+        self.dataparallel_model.train(False)
+
         test_loss = 0
         correct = 0
-        with torch.no_grad():
-            for data, target in self.test_loader:
-                data, target = data.to(self.device), target.to(self.device)
-                output = self.model(data)
-                test_loss += self.loss_func(output, target).item()  # sum up batch loss
-                pred = output.argmax(dim=1, keepdim=True)  # get the index of the max log-probability
-                correct += pred.eq(target.view_as(pred)).sum().item()
+        for data, target in self.test_loader:
+            data, target = data.to(self.device), target.to(self.device)
+            step_info_dp = self.dataparallel_model.step(data, target)
+            test_loss += step_info_dp["loss"]  # sum up batch loss
+            pred = step_info_dp["output"].argmax(dim=1, keepdim=True)  # get the index of the max log-probability
+            correct += pred.eq(target.view_as(pred)).sum().item()
 
         test_loss /= len(self.test_loader.dataset)
 
@@ -271,7 +304,7 @@ class Trainer:
             100. * correct / len(self.test_loader.dataset)))
 
 
-def main():
+def parse_args(external_args=None):
     # Training settings
     parser = argparse.ArgumentParser(description='PyTorch MNIST Example')
     parser.add_argument('--batch-size', type=int, default=64, metavar='N',
@@ -294,8 +327,17 @@ def main():
                         help='how many batches to wait before logging training status')
     parser.add_argument('--save-model', action='store_true', default=False,
                         help='For Saving the current Model')
-    args = parser.parse_args()
+    parser.add_argument('--num-replicas', type=int, default=4, metavar='N',
+                        help='number of dataparallel replicas (default: 4)')
+    if external_args is not None:
+        args = parser.parse_args(external_args)
+    else:
+        args = parser.parse_args()
+    return args
 
+
+def main():
+    args = parse_args()
     trainer = Trainer(args)
     trainer.train()
 
