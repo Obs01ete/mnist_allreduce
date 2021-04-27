@@ -9,7 +9,9 @@
 https://www.jetbrains.com/pycharm/download/#section=windows
 
 ## Modify allreduce implementation
-Search for `# Modify gradient allreduce here` and update code there
+Search for `# Modify gradient allreduce here` and update code there. Replace star-reduce code with ring-allreduce as per:
+1. https://towardsdatascience.com/distributed-deep-learning-with-horovod-2d1eea004cb2
+2. https://towardsdatascience.com/visual-intuition-on-ring-allreduce-for-distributed-deep-learning-d1f34b4911da
 
 ## Run tests to make sure that weight all-reduce gives correct results
 ```bash

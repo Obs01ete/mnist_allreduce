@@ -35,12 +35,11 @@ class TestDataParallel(unittest.TestCase):
                         print("None")
                     print("")
 
-                rtol = 1e-3
-                tt.assert_allclose(ref_np[1].data, dp_np[1].data, rtol=rtol)
+                rtol = 2e-2
+                atol = 1e-7
+                tt.assert_allclose(ref_np[1].data, dp_np[1].data, rtol=rtol, atol=atol)
                 if ref_np[1].grad is not None and dp_np[1].grad is not None:
                     tt.assert_allclose(ref_np[1].grad, dp_np[1].grad, rtol=rtol)
-
-                break
 
         def _check_dp_models_equal():
             dp_model = trainer.dataparallel_model
