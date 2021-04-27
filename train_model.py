@@ -15,10 +15,10 @@ from torch.optim.lr_scheduler import StepLR
 class Net(nn.Module):
     def __init__(self):
         super(Net, self).__init__()
-        self.conv1 = nn.Conv2d(1, 32, kernel_size=3, stride=1)
-        self.conv2 = nn.Conv2d(32, 64, kernel_size=3, stride=1)
-        # self.dropout1 = nn.Dropout(0.25)
-        # self.dropout2 = nn.Dropout(0.5)
+        self.conv1 = nn.Conv2d(1, 32, 3, stride=1)
+        self.conv2 = nn.Conv2d(32, 64, 3, stride=1)
+        self.dropout1 = nn.Dropout(0.25)
+        self.dropout2 = nn.Dropout(0.5)
         self.fc1 = nn.Linear(9216, 128)
         self.fc2 = nn.Linear(128, 10)
 
@@ -28,11 +28,11 @@ class Net(nn.Module):
         x = self.conv2(x)
         x = F.relu(x)
         x = F.max_pool2d(x, 2)
-        # x = self.dropout1(x)
+        x = self.dropout1(x)
         x = torch.flatten(x, 1)
         x = self.fc1(x)
         x = F.relu(x)
-        # x = self.dropout2(x)
+        x = self.dropout2(x)
         x = self.fc2(x)
         output = F.log_softmax(x, dim=1)
         return output
@@ -114,11 +114,14 @@ class DataparallelModel(GenericModel):
         self.master_model_idx = 0
 
         if reference_model is not None:
+            # If a reference model is given, broadcast it
             for param_group, ref_param in zip(self.param_group_gen(), reference_model.named_parameters()):
                 for param in param_group:
                     param.data[...] = ref_param[1].data[...]
         else:
+            # If there is no reference model, broadcast weights of the master model
             for param_group in self.param_group_gen():
+                assert self.master_model_idx == 0
                 for param in param_group[1:]:
                     param.data[...] = param_group[self.master_model_idx].data[...]
 
@@ -216,10 +219,16 @@ class Trainer:
             transforms.ToTensor(),
             transforms.Normalize((0.1307,), (0.3081,))
         ])
-        self.dataset_train = datasets.MNIST('../data', train=True, download=True,
-                                       transform=transform)
-        self.dataset_val = datasets.MNIST('../data', train=False,
-                                       transform=transform)
+        self.dataset_train = datasets.MNIST('../data', train=False, download=True, transform=transform)
+        self.dataset_val = datasets.MNIST('../data', train=False, transform=transform)
+        shrink_dataset = True
+        if shrink_dataset:
+            train_data_size = 2000
+            val_data_size = 1000
+            self.dataset_train.data = self.dataset_train.data[:train_data_size]
+            self.dataset_train.targets = self.dataset_train.targets[:train_data_size]
+            self.dataset_val.data = self.dataset_val.data[:val_data_size]
+            self.dataset_val.targets = self.dataset_val.targets[:val_data_size]
         self.train_loader = torch.utils.data.DataLoader(self.dataset_train, **train_kwargs)
         self.test_loader = torch.utils.data.DataLoader(self.dataset_val, **test_kwargs)
 
@@ -279,7 +288,7 @@ class Trainer:
             data, target = data.to(self.device), target.to(self.device)
             step_info_dp = self.dataparallel_model.step(data, target, no_grad=True)
             test_loss += step_info_dp["loss"]  # sum up batch loss
-            pred = step_info_dp["output"].argmax(dim=1, keepdim=True)  # get the index of the max log-probability
+            pred = step_info_dp["pred"].argmax(dim=1, keepdim=True)  # get the index of the max log-probability
             correct += pred.eq(target.view_as(pred)).sum().item()
 
         test_loss /= len(self.test_loader.dataset)

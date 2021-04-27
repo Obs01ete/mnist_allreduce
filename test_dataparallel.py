@@ -11,8 +11,8 @@ class TestDataParallel(unittest.TestCase):
         args = parse_args(external_args=[])
         trainer = Trainer(args)
 
-        trainer.reference_model.train(True)
-        trainer.dataparallel_model.train(True)
+        trainer.reference_model.train(False)
+        trainer.dataparallel_model.train(False)
 
         def _compare_models():
             for i_layer, (ref_np, dp_np) in enumerate(zip(
