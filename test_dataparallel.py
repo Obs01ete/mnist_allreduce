@@ -48,7 +48,8 @@ class TestDataParallel(unittest.TestCase):
                     continue
                 master_model_params = dp_model.models[dp_model.master_model_idx].parameters()
                 model_params = model.parameters()
-                for i_layer, (master_param, secondary_param) in enumerate(zip(master_model_params, model_params)):
+                for i_layer, (master_param, secondary_param) in \
+                        enumerate(zip(master_model_params, model_params)):
                     if i_layer == 0:
                         print(f"Master model and model {i_model}")
                         print(master_param[0, 0, ...])

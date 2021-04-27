@@ -115,7 +115,8 @@ class DataparallelModel(GenericModel):
 
         if reference_model is not None:
             # If a reference model is given, broadcast it
-            for param_group, ref_param in zip(self.param_group_gen(), reference_model.named_parameters()):
+            for param_group, ref_param in \
+                    zip(self.param_group_gen(), reference_model.named_parameters()):
                 for param in param_group:
                     param.data[...] = ref_param[1].data[...]
         else:
@@ -172,13 +173,6 @@ class DataparallelModel(GenericModel):
 
         return dict(loss=total_loss, pred=outputs)
 
-    def named_gradients(self):
-        assert len(self.models) > 0
-        def grad_gen():
-            for param in self.models[self.master_model_idx].named_parameters():
-                yield param[0], param[1].data.grad
-        return grad_gen()
-
     def named_parameters(self):
         assert len(self.models) > 0
         return self.models[self.master_model_idx].named_parameters()
@@ -222,14 +216,17 @@ class Trainer:
         ])
         self.dataset_train = datasets.MNIST('../data', train=False, download=True, transform=transform)
         self.dataset_val = datasets.MNIST('../data', train=False, transform=transform)
+
         shrink_dataset = True
         if shrink_dataset:
             train_data_size = 2000
             val_data_size = 1000
-            self.dataset_train.data = self.dataset_train.data[:train_data_size]
-            self.dataset_train.targets = self.dataset_train.targets[:train_data_size]
-            self.dataset_val.data = self.dataset_val.data[:val_data_size]
-            self.dataset_val.targets = self.dataset_val.targets[:val_data_size]
+            def _shrink_dataset(dataset, size):
+                dataset.data = dataset.data[:size]
+                dataset.targets = dataset.targets[:size]
+            _shrink_dataset(self.dataset_train, train_data_size)
+            _shrink_dataset(self.dataset_val, val_data_size)
+
         self.train_loader = torch.utils.data.DataLoader(self.dataset_train, **train_kwargs)
         self.test_loader = torch.utils.data.DataLoader(self.dataset_val, **test_kwargs)
 
@@ -244,7 +241,8 @@ class Trainer:
         def lr_scheduler_factory(optimizer):
             return StepLR(optimizer, step_size=1, gamma=args.gamma)
 
-        self.reference_model = ReferenceModel(net_factory, optimizer_factory, lr_scheduler_factory, self.loss_func)
+        self.reference_model = ReferenceModel(net_factory, optimizer_factory,
+                                              lr_scheduler_factory, self.loss_func)
 
         num_replicas = args.num_replicas
         self.dataparallel_model = DataparallelModel(net_factory, optimizer_factory, lr_scheduler_factory,
