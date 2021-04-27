@@ -154,11 +154,12 @@ class DataparallelModel(GenericModel):
 
         outputs = torch.cat(outputs, dim=0)
 
-        # gradient allreduce here
-
         if not no_grad:
             for param_group in self.param_group_gen():
                 param_group_data = tuple(p.grad for p in param_group)
+
+                # Modify gradient allreduce here
+                # Below is a star-allreduce implementation. Replace it with your own.
                 reduced_tensor = torch.mean(torch.stack(param_group_data, dim=0), dim=0)
                 for grad in param_group_data:
                     grad[...] = reduced_tensor[...]
