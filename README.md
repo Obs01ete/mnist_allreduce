@@ -2,7 +2,7 @@
 
 ## Create and activate conda environment
 1. Install Anaconda python virtual environment manager (miniconda is recommended)
-2. Create conda environment and install required packages `conda create -n allreduce_env -f environment.yml`
+2. Create conda environment and install required packages `conda env create -n allreduce_env -f environment.yml`
 3. Activate the environment `conda activate allreduce_env`
 
 ## Install PyCharm
